@@ -1,0 +1,430 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+class BikeRentalPredictor:
+    def __init__(self):
+        self.models = {}
+        self.scaler = StandardScaler()
+        self.label_encoders = {}
+        self.feature_importance = {}
+        self.trained_df = None # Store the dataframe used for training
+
+    def load_and_prepare_data(self, data_path=None, sample_data=False):
+        """
+        Load and prepare bike rental data
+        If sample_data=True, generates synthetic data for demonstration
+        """
+        if sample_data or data_path is None:
+            # Generate synthetic data for demonstration
+            np.random.seed(42)
+
+            dates = pd.date_range(start='2023-01-01', end='2023-12-31', freq='H')
+            n_samples = len(dates)
+
+            # Create synthetic features
+            data = {
+                'datetime': dates,
+                'season': np.random.choice([1, 2, 3, 4], n_samples),
+                'holiday': np.random.choice([0, 1], n_samples, p=[0.95, 0.05]),
+                'workingday': np.random.choice([0, 1], n_samples, p=[0.3, 0.7]),
+                'weather': np.random.choice([1, 2, 3, 4], n_samples, p=[0.7, 0.2, 0.08, 0.02]),
+                'temp': np.random.normal(20, 10, n_samples),
+                'atemp': np.random.normal(20, 10, n_samples),
+                'humidity': np.random.uniform(0, 100, n_samples),
+                'windspeed': np.random.exponential(10, n_samples)
+            }
+
+            df = pd.DataFrame(data)
+
+            # Create realistic bike count based on features
+            df['hour'] = df['datetime'].dt.hour
+            df['day_of_week'] = df['datetime'].dt.dayofweek
+            df['month'] = df['datetime'].dt.month
+
+            # Base count influenced by various factors
+            base_count = 100
+
+            # Hour effect (rush hours have more bikes)
+            hour_effect = np.where(df['hour'].isin([7, 8, 17, 18, 19]), 1.8, 1.0)
+            hour_effect = np.where(df['hour'].isin([9, 10, 11, 12, 13, 14, 15, 16]), 1.3, hour_effect)
+            hour_effect = np.where(df['hour'].isin([0, 1, 2, 3, 4, 5]), 0.2, hour_effect)
+
+            # Working day effect
+            workday_effect = np.where(df['workingday'] == 1, 1.4, 1.0)
+
+            # Weather effect
+            weather_effect = np.where(df['weather'] == 1, 1.2, 1.0)
+            weather_effect = np.where(df['weather'] == 2, 1.0, weather_effect)
+            weather_effect = np.where(df['weather'] == 3, 0.6, weather_effect)
+            weather_effect = np.where(df['weather'] == 4, 0.3, weather_effect)
+
+            # Temperature effect (optimal around 20-25°C)
+            temp_effect = 1 - np.abs(df['temp'] - 22.5) / 50
+            temp_effect = np.clip(temp_effect, 0.3, 1.5)
+
+            # Season effect
+            season_effect = np.where(df['season'] == 1, 0.8, 1.0)  # Winter
+            season_effect = np.where(df['season'] == 2, 1.2, season_effect)  # Spring
+            season_effect = np.where(df['season'] == 3, 1.3, season_effect)  # Summer
+            season_effect = np.where(df['season'] == 4, 1.1, season_effect)  # Fall
+
+            # Holiday effect
+            holiday_effect = np.where(df['holiday'] == 1, 0.7, 1.0)
+
+            # Calculate count with some noise
+            df['count'] = (base_count * hour_effect * workday_effect * weather_effect *
+                          temp_effect * season_effect * holiday_effect *
+                          np.random.normal(1, 0.1, n_samples))
+
+            df['count'] = np.clip(df['count'], 0, None).astype(int)
+
+        else:
+            # Load actual data
+            df = pd.read_csv(data_path)
+            df['datetime'] = pd.to_datetime(df['datetime'])
+
+        return df
+
+    def engineer_features(self, df):
+        """
+        Create additional features from the dataset
+        """
+        df = df.copy()
+
+        # Extract datetime components
+        df['hour'] = df['datetime'].dt.hour
+        df['day_of_week'] = df['datetime'].dt.dayofweek
+        df['month'] = df['datetime'].dt.month
+        df['day_of_month'] = df['datetime'].dt.day
+        df['week_of_year'] = df['datetime'].dt.isocalendar().week
+        df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+
+        # Cyclical features for time
+        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+        df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+        df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+        df['day_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+        df['day_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+
+        # Rush hour indicators
+        df['is_rush_hour'] = ((df['hour'] >= 7) & (df['hour'] <= 9) |
+                             (df['hour'] >= 17) & (df['hour'] <= 19)).astype(int)
+
+        # Business hours
+        df['is_business_hour'] = ((df['hour'] >= 8) & (df['hour'] <= 18)).astype(int)
+
+        # Weather interaction features
+        df['temp_humidity'] = df['temp'] * df['humidity'] / 100
+        df['temp_windspeed'] = df['temp'] * df['windspeed']
+
+        # Comfort index (combination of temp and humidity)
+        df['comfort_index'] = df['temp'] - (df['humidity'] / 100) * (df['temp'] - 14)
+
+        # Lag features (if enough data)
+        if len(df) > 168:  # At least a week of data
+            df['count_lag_1h'] = df['count'].shift(1)
+            df['count_lag_24h'] = df['count'].shift(24)
+            df['count_lag_168h'] = df['count'].shift(168)  # 1 week
+
+            # Rolling averages
+            df['count_rolling_24h'] = df['count'].rolling(window=24, min_periods=1).mean()
+            df['count_rolling_168h'] = df['count'].rolling(window=168, min_periods=1).mean()
+
+        return df
+
+    def preprocess_data(self, df):
+        """
+        Preprocess the data for training
+        """
+        df = df.copy()
+
+        # Handle missing values
+        df = df.fillna(method='ffill').fillna(method='bfill')
+
+        # Define feature columns
+        feature_cols = [col for col in df.columns if col not in ['datetime', 'count']]
+
+        # Encode categorical variables
+        categorical_cols = ['season', 'weather']
+        for col in categorical_cols:
+            if col in df.columns:
+                if col not in self.label_encoders:
+                    self.label_encoders[col] = LabelEncoder()
+                    df[col] = self.label_encoders[col].fit_transform(df[col])
+                else:
+                    df[col] = self.label_encoders[col].transform(df[col])
+
+        return df, feature_cols
+
+    def train_models(self, df, feature_cols, target_col='count'):
+        """
+        Train multiple models and compare performance
+        """
+        self.trained_df = df.copy() # Store the dataframe used for training
+        X = df[feature_cols]
+        y = df[target_col]
+
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, shuffle=False
+        )
+
+        # Scale features
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+
+        # Define models
+        models = {
+            'Random Forest': RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
+            'Gradient Boosting': GradientBoostingRegressor(n_estimators=100, random_state=42),
+            'XGBoost': xgb.XGBRegressor(n_estimators=100, random_state=42, n_jobs=-1),
+            'Linear Regression': LinearRegression()
+        }
+
+        results = {}
+
+        for name, model in models.items():
+            print(f"Training {name}...")
+
+            if name == 'Linear Regression':
+                model.fit(X_train_scaled, y_train)
+                y_pred = model.predict(X_test_scaled)
+            else:
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_test)
+
+            # Calculate metrics
+            mae = mean_absolute_error(y_test, y_pred)
+            mse = mean_squared_error(y_test, y_pred)
+            rmse = np.sqrt(mse)
+            r2 = r2_score(y_test, y_pred)
+
+            results[name] = {
+                'model': model,
+                'MAE': mae,
+                'MSE': mse,
+                'RMSE': rmse,
+                'R2': r2,
+                'predictions': y_pred
+            }
+
+            # Store feature importance
+            if hasattr(model, 'feature_importances_'):
+                self.feature_importance[name] = dict(zip(feature_cols, model.feature_importances_))
+
+            print(f"{name} - MAE: {mae:.2f}, RMSE: {rmse:.2f}, R2: {r2:.4f}")
+
+        self.models = {name: result['model'] for name, result in results.items()}
+
+        return results, X_test, y_test
+
+    def hyperparameter_tuning(self, df, feature_cols, target_col='count'):
+        """
+        Perform hyperparameter tuning for the best models
+        """
+        X = df[feature_cols]
+        y = df[target_col]
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, shuffle=False
+        )
+
+        # XGBoost tuning
+        xgb_params = {
+            'n_estimators': [100, 200, 300],
+            'max_depth': [3, 5, 7],
+            'learning_rate': [0.01, 0.1, 0.2],
+            'subsample': [0.8, 0.9, 1.0]
+        }
+
+        xgb_model = xgb.XGBRegressor(random_state=42, n_jobs=-1)
+        xgb_grid = GridSearchCV(xgb_model, xgb_params, cv=5, scoring='neg_mean_absolute_error', n_jobs=-1)
+        xgb_grid.fit(X_train, y_train)
+
+        # Random Forest tuning
+        rf_params = {
+            'n_estimators': [100, 200, 300],
+            'max_depth': [10, 15, 20, None],
+            'min_samples_split': [2, 5, 10],
+            'min_samples_leaf': [1, 2, 4]
+        }
+
+        rf_model = RandomForestRegressor(random_state=42, n_jobs=-1)
+        rf_grid = GridSearchCV(rf_model, rf_params, cv=5, scoring='neg_mean_absolute_error', n_jobs=-1)
+        rf_grid.fit(X_train, y_train)
+
+        print("Best XGBoost parameters:", xgb_grid.best_params_)
+        print("Best Random Forest parameters:", rf_grid.best_params_)
+
+        # Store best models
+        self.models['XGBoost_tuned'] = xgb_grid.best_estimator_
+        self.models['RandomForest_tuned'] = rf_grid.best_estimator_
+
+        return xgb_grid.best_estimator_, rf_grid.best_estimator_
+
+    def predict_future(self, model_name, hours_ahead=24):
+        """
+        Predict bike counts for future hours
+        """
+        if model_name not in self.models:
+            raise ValueError(f"Model {model_name} not found")
+
+        model = self.models[model_name]
+
+        # Get the last datetime from the training data
+        last_datetime = self.trained_df['datetime'].max()
+
+        # Create future datetime range
+        future_dates = [last_datetime + timedelta(hours=i) for i in range(1, hours_ahead + 1)]
+
+        # Create future features (simplified - would need actual weather forecasts)
+        future_features_list = []
+        for dt in future_dates:
+            features = {
+                'datetime': dt, # Include datetime for feature engineering
+                'hour': dt.hour,
+                'day_of_week': dt.weekday(),
+                'month': dt.month,
+                'day_of_month': dt.day,
+                'week_of_year': dt.isocalendar()[1],
+                'is_weekend': int(dt.weekday() >= 5),
+                'hour_sin': np.sin(2 * np.pi * dt.hour / 24),
+                'hour_cos': np.cos(2 * np.pi * dt.hour / 24),
+                'month_sin': np.sin(2 * np.pi * dt.month / 12),
+                'month_cos': np.cos(2 * np.pi * dt.month / 12),
+                'day_sin': np.sin(2 * np.pi * dt.weekday() / 7),
+                'day_cos': np.cos(2 * np.pi * dt.weekday() / 7),
+                'is_rush_hour': int((7 <= dt.hour <= 9) or (17 <= dt.hour <= 19)),
+                'is_business_hour': int(8 <= dt.hour <= 18),
+                # Add other features with default values - these should ideally come from a forecast
+                'season': 2, 'holiday': 0, 'workingday': 1, 'weather': 1,
+                'temp': 20, 'atemp': 20, 'humidity': 50, 'windspeed': 10,
+                'temp_humidity': 10, 'temp_windspeed': 200, 'comfort_index': 18
+            }
+            future_features_list.append(features)
+
+        future_df = pd.DataFrame(future_features_list)
+
+        # Combine with the last part of the training data to calculate lag and rolling features
+        combined_df = pd.concat([self.trained_df.tail(168), future_df], ignore_index=True)
+
+        # Engineer features for the combined dataframe
+        combined_df = self.engineer_features(combined_df)
+
+        # Select only the future data and the necessary feature columns
+        future_df_processed = combined_df.tail(hours_ahead).drop(columns=['datetime', 'count'], errors='ignore')
+
+
+        # Ensure feature columns match the training data
+        trained_feature_cols = [col for col in self.trained_df.columns if col not in ['datetime', 'count']]
+        future_df_processed = future_df_processed[trained_feature_cols]
+
+
+        # Make predictions
+        predictions = model.predict(future_df_processed)
+
+        return list(zip(future_dates, predictions))
+
+    def plot_results(self, results, X_test, y_test, feature_cols):
+        """
+        Plot model comparison and feature importance
+        """
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+
+        # Model comparison
+        model_names = list(results.keys())
+        metrics = ['MAE', 'RMSE', 'R2']
+
+        for i, metric in enumerate(metrics):
+            values = [results[name][metric] for name in model_names]
+            axes[0, 0].bar(model_names, values, alpha=0.7)
+            axes[0, 0].set_title(f'{metric} Comparison')
+            axes[0, 0].set_ylabel(metric)
+            axes[0, 0].tick_params(axis='x', rotation=45)
+
+        # Actual vs Predicted for best model
+        best_model = min(results.keys(), key=lambda x: results[x]['MAE'])
+        y_pred_best = results[best_model]['predictions']
+
+        axes[0, 1].scatter(y_test, y_pred_best, alpha=0.5)
+        axes[0, 1].plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
+        axes[0, 1].set_xlabel('Actual Count')
+        axes[0, 1].set_ylabel('Predicted Count')
+        axes[0, 1].set_title(f'Actual vs Predicted ({best_model})')
+
+        # Feature importance
+        if best_model in self.feature_importance:
+            importance = self.feature_importance[best_model]
+            sorted_features = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:10]
+            features, importances = zip(*sorted_features)
+
+            axes[1, 0].barh(features, importances)
+            axes[1, 0].set_xlabel('Feature Importance')
+            axes[1, 0].set_title('Top 10 Feature Importances')
+
+        # Residuals plot
+        residuals = y_test - y_pred_best
+        axes[1, 1].scatter(y_pred_best, residuals, alpha=0.5)
+        axes[1, 1].axhline(y=0, color='r', linestyle='--')
+        axes[1, 1].set_xlabel('Predicted Count')
+        axes[1, 1].set_ylabel('Residuals')
+        axes[1, 1].set_title('Residuals Plot')
+
+        plt.tight_layout()
+        plt.show()
+
+        return best_model
+
+# Example usage
+def main():
+    # Initialize predictor
+    predictor = BikeRentalPredictor()
+
+    # Load data (using synthetic data for demonstration)
+    print("Loading and preparing data...")
+    df = predictor.load_and_prepare_data(sample_data=True)
+
+    # Engineer features
+    print("Engineering features...")
+    df = predictor.engineer_features(df)
+
+    # Preprocess data
+    print("Preprocessing data...")
+    df, feature_cols = predictor.preprocess_data(df)
+
+    # Train models
+    print("Training models...")
+    results, X_test, y_test = predictor.train_models(df, feature_cols)
+
+    # Plot results
+    print("Plotting results...")
+    best_model = predictor.plot_results(results, X_test, y_test, feature_cols)
+
+    # Make future predictions
+    print(f"\nMaking predictions with {best_model}...")
+    future_predictions = predictor.predict_future(best_model, hours_ahead=24)
+
+    print("\nNext 24 hours predictions:")
+    for datetime, count in future_predictions[:10]:  # Show first 10
+        print(f"{datetime.strftime('%Y-%m-%d %H:%M')}: {count:.0f} bikes")
+
+    # Hyperparameter tuning (optional - takes longer)
+    print("\nPerforming hyperparameter tuning...")
+    tuned_xgb, tuned_rf = predictor.hyperparameter_tuning(df, feature_cols)
+
+    return predictor, df, results
+
+if __name__ == "__main__":
+    predictor, df, results = main()
